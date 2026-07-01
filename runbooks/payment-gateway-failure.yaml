@@ -1,0 +1,100 @@
+# runbooks/payment-gateway-failure.yaml
+#
+# This runbook handles the most common payment service failure:
+# Stripe API outage causing connection pool exhaustion.
+#
+# Before this runbook existed: 40-minute MTTR, 8 human decisions
+# After this runbook:           7-minute MTTR, 1 human decision (approval)
+---
+name: "Payment Gateway Failure"
+version: "2.0.0"
+severity: "critical"
+mttr_target: "5_minutes"
+
+triggers:
+  - alert: "HighPaymentFailureRate"
+    threshold: ">5%"
+    duration: "5m"
+
+safe_state:
+  # These actions are ALWAYS forbidden — no approval can override them.
+  read_only:
+    - "delete_database"
+    - "modify_production_config_directly"
+    - "restart_kubernetes_cluster"
+    - "drop_table"
+
+  # These actions require a human to click Approve on the dashboard
+  # before execution. The agent parks and waits.
+  requires_approval:
+    - "switch_payment_gateway"
+    - "scale_down_service"
+    - "modify_rate_limits"
+    - "increase_pool_size"
+
+diagnostic_steps:
+  - step: 1
+    name: "Verify Alert Validity"
+    command: |
+      curl -sf "http://prometheus.internal/api/v1/query?query=rate(payment_failures_total[5m])"
+    timeout: 30s
+    ai_interpret: |
+      Is the failure rate spiking or sustained? Distinguish between a transient blip
+      and a real outage. Check if the failure rate correlates with a deployment timestamp.
+
+  - step: 2
+    name: "Check Payment Gateway Health"
+    command: |
+      curl -sf -o /dev/null -w "%{http_code}" https://api.stripe.com/v1/health
+    timeout: 30s
+    ai_interpret: |
+      If Stripe returns 503 or times out, the root cause is an upstream provider outage.
+      Propose switching to the PayPal backup gateway.
+      If Stripe is healthy, the issue is in our integration — investigate connection pool.
+
+  - step: 3
+    name: "Check Connection Pool Utilisation"
+    command: |
+      kubectl get deployment payment-service -n production -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="DB_POOL_SIZE")].value}'
+    timeout: 30s
+    ai_interpret: |
+      Compare pool size to the number of active connections from Prometheus.
+      If pool is >90% utilised, propose increasing DB_POOL_SIZE.
+      Note: this action requires_approval (it modifies a deployment).
+
+  - step: 4
+    name: "Review Recent Deployments"
+    command: |
+      kubectl rollout history deployment/payment-service -n production --revision=0
+    timeout: 30s
+    ai_interpret: |
+      Did a deployment happen in the last 30 minutes? If yes, correlate the deployment
+      timestamp with the failure onset. If correlated, propose a rollback instead.
+
+recovery_actions:
+  - condition: "stripe_down"
+    action: "switch_payment_gateway"
+    requires_approval: true
+    command: |
+      kubectl patch configmap payment-config -n production \
+        -p '{"data":{"PAYMENT_GATEWAY":"paypal"}}'
+    rollback_command: |
+      kubectl patch configmap payment-config -n production \
+        -p '{"data":{"PAYMENT_GATEWAY":"stripe"}}'
+
+  - condition: "database_connection_pool_exhausted"
+    action: "increase_pool_size"
+    requires_approval: true
+    command: |
+      kubectl patch deployment payment-service -n production \
+        -p '{"spec":{"template":{"spec":{"containers":[{"name":"app","env":[{"name":"DB_POOL_SIZE","value":"150"}]}]}}}}'
+    rollback_command: |
+      kubectl patch deployment payment-service -n production \
+        -p '{"spec":{"template":{"spec":{"containers":[{"name":"app","env":[{"name":"DB_POOL_SIZE","value":"50"}]}]}}}}'
+
+  - condition: "deployment_regression"
+    action: "rollback_deployment"
+    requires_approval: true
+    command: |
+      kubectl rollout undo deployment/payment-service -n production
+    rollback_command: ""
